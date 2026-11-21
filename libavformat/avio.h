@@ -342,6 +342,19 @@ int avio_check(const char *url, int flags);
 int avio_open_dir(AVIODirContext **s, const char *url, AVDictionary **options);
 
 /**
+ * Open directory for reading, with an interrupt callback for the protocol.
+ *
+ * @param s       directory read context. Pointer to a NULL pointer must be passed.
+ * @param url     directory to be listed.
+ * @param int_cb  an interrupt callback to be used at the protocols level, may be NULL.
+ * @param options A dictionary filled with protocol-private options. On return
+ *                this parameter will be destroyed and replaced with a dictionary
+ *                containing options that were not found. May be NULL.
+ * @return >=0 on success or negative on error.
+ */
+int avio_open_dir2(AVIODirContext **s, const char *url, const AVIOInterruptCB *int_cb, AVDictionary **options);
+
+/**
  * Get next directory entry.
  *
  * Returned entry must be freed with avio_free_directory_entry(). In particular
@@ -461,17 +474,17 @@ int avio_put_str16be(AVIOContext *s, const char *str);
 void avio_write_marker(AVIOContext *s, int64_t time, enum AVIODataMarkerType type);
 
 /**
- * ORing this as the "whence" parameter to a seek function causes it to
+ * Passing this as the "whence" parameter to a seek function causes it to
  * return the filesize without seeking anywhere. Supporting this is optional.
  * If it is not supported then the seek function will return <0.
  */
 #define AVSEEK_SIZE 0x10000
 
 /**
- * Passing this flag as the "whence" parameter to a seek function causes it to
+ * OR'ing this flag into the "whence" parameter to a seek function causes it to
  * seek by any means (like reopening and linear reading) or other normally unreasonable
  * means that can be extremely slow.
- * This may be ignored by the seek code.
+ * This is the default and therefore ignored by the seek code since 2010.
  */
 #define AVSEEK_FORCE 0x20000
 

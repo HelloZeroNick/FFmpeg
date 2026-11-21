@@ -102,9 +102,9 @@ static int flac_read_header(AVFormatContext *s)
                 return AVERROR(ENOMEM);
             }
             ret = ffio_read_size(s->pb, buffer, metadata_size);
-            if (ret < 0) {
-                RETURN_ERROR(ret);
-            }
+            if (ret < 0)
+                goto fail;
+
             break;
         /* skip metadata block for unsupported types */
         default:
@@ -276,7 +276,7 @@ static int flac_probe(const AVProbeData *p)
     return 0;
 }
 
-static av_unused int64_t flac_read_timestamp(AVFormatContext *s, int stream_index,
+av_unused static int64_t flac_read_timestamp(AVFormatContext *s, int stream_index,
                                              int64_t *ppos, int64_t pos_limit)
 {
     FLACDecContext *flac = s->priv_data;
@@ -284,7 +284,7 @@ static av_unused int64_t flac_read_timestamp(AVFormatContext *s, int stream_inde
     AVPacket *const pkt = si->parse_pkt;
     AVStream *st = s->streams[stream_index];
     AVCodecParserContext *parser;
-    int ret;
+    int ret = 0;
     int64_t pts = AV_NOPTS_VALUE;
 
     if (avio_seek(s->pb, *ppos, SEEK_SET) < 0)
@@ -309,7 +309,12 @@ static av_unused int64_t flac_read_timestamp(AVFormatContext *s, int stream_inde
         uint8_t *data;
         int size;
 
-        ret = ff_raw_read_partial_packet(s, pkt);
+        if (ret >= 0 || ret == AVERROR(EAGAIN))
+            ret = ff_raw_read_partial_packet(s, pkt);
+        if (!ret) {
+            av_packet_unref(pkt);
+            continue;
+        }
         if (ret < 0){
             if (ret == AVERROR(EAGAIN))
                 continue;
@@ -385,4 +390,5 @@ const FFInputFormat ff_flac_demuxer = {
     .read_timestamp = flac_read_timestamp,
     .raw_codec_id   = AV_CODEC_ID_FLAC,
     .priv_data_size = sizeof(FLACDecContext),
+    .flags_internal = FF_INFMT_FLAG_ID3V2_AUTO,
 };

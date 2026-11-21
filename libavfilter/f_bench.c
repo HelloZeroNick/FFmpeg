@@ -80,7 +80,7 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *in)
             s->n++;
             s->min = FFMIN(s->min, diff);
             s->max = FFMAX(s->max, diff);
-            av_log(s, AV_LOG_INFO, "t:%f avg:%f max:%f min:%f\n",
+            av_log(ctx, AV_LOG_INFO, "t:%f avg:%f max:%f min:%f\n",
                    T2F(diff), T2F(s->sum / s->n), T2F(s->max), T2F(s->min));
         }
         av_dict_set(&in->metadata, START_TIME_KEY, NULL, 0);
@@ -110,6 +110,7 @@ const FFFilter ff_vf_bench = {
     .init          = init,
     FILTER_INPUTS(bench_inputs),
     FILTER_OUTPUTS(ff_video_default_filterpad),
+    .flags_internal = FF_FILTER_FLAG_DYNAMIC_FRAME_PARAMS,
 };
 #endif /* CONFIG_BENCH_FILTER */
 

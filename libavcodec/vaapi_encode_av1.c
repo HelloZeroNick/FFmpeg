@@ -847,7 +847,7 @@ static const VAAPIEncodeProfile vaapi_encode_av1_profiles[] = {
 
 static const VAAPIEncodeType vaapi_encode_type_av1 = {
     .profiles        = vaapi_encode_av1_profiles,
-    .flags           = FF_HW_FLAG_B_PICTURES | FLAG_TIMESTAMP_NO_DELAY,
+    .flags           = FF_HW_FLAG_B_PICTURES | FF_HW_FLAG_TIMESTAMP_NO_DELAY,
     .default_quality = 25,
 
     .get_encoder_caps = &vaapi_encode_av1_get_encoder_caps,
@@ -1027,6 +1027,7 @@ static const FFCodecDefault vaapi_encode_av1_defaults[] = {
     { "g",              "120" },
     { "qmin",           "1"   },
     { "qmax",           "255" },
+    { "refs",           "0"   },
     { NULL },
 };
 
