@@ -42,14 +42,17 @@
 #include "codec_internal.h"
 #include "decode.h"
 #include "dovi_rpu.h"
+#include "get_bits.h"
 #include "h2645_parse.h"
+#include "h2645_sei.h"
 #include "hevc/hevc.h"
+#include "sei.h"
 #include "hwconfig.h"
 #include "ohcodec.h"
 #include "ohcodec_buffer.h"
 #include "pthread_internal.h"
 
-#define OH_DOVI_QUEUE_SIZE 64
+#define OH_HDR_QUEUE_SIZE 64
 
 /*
  * HarmonyOS smart fluency (intelligent frame retention), available since
@@ -82,11 +85,15 @@ typedef struct OHCodecDecQueueItem {
     uint64_t generation;
 } OHCodecDecQueueItem;
 
-typedef struct OHDoviFrame {
+// Per-picture HDR metadata recovered from the bitstream (see
+// oh_decode_parse_hdr), held until the decoder outputs the picture.
+typedef struct OHHdrFrame {
     int64_t pts;
-    AVBufferRef *rpu;
-    AVBufferRef *metadata;
-} OHDoviFrame;
+    AVBufferRef *dovi_rpu;
+    AVBufferRef *dovi_metadata;
+    AVBufferRef *hdr_vivid;
+    AVBufferRef *hdr_plus;
+} OHHdrFrame;
 
 typedef struct OHCodecDecRef {
     OH_AVCodec *dec;
@@ -113,9 +120,12 @@ typedef struct OHCodecDecContext {
     AVPacket pkt;
 
     DOVIContext dovi_ctx;
-    H2645Packet dovi_pkt;
-    OHDoviFrame dovi_frames[OH_DOVI_QUEUE_SIZE];
-    int nb_dovi_frames;
+    H2645Packet hdr_pkt;
+    OHHdrFrame hdr_frames[OH_HDR_QUEUE_SIZE];
+    int nb_hdr_frames;
+    // Static HDR10 metadata from SEI, in effect for every output frame.
+    H2645SEIMasteringDisplay mastering_display;
+    H2645SEIContentLight content_light;
 
     int decode_status;
     bool eof_sent;
@@ -177,23 +187,146 @@ static void oh_decode_invalidate_outputs(OHCodecDecContext *s)
                               memory_order_acq_rel);
 }
 
-static void oh_decode_clear_dovi(OHCodecDecContext *s)
+static void oh_decode_unref_hdr(OHHdrFrame *hdr)
 {
-    for (int i = 0; i < s->nb_dovi_frames; i++) {
-        av_buffer_unref(&s->dovi_frames[i].rpu);
-        av_buffer_unref(&s->dovi_frames[i].metadata);
-    }
-    s->nb_dovi_frames = 0;
+    av_buffer_unref(&hdr->dovi_rpu);
+    av_buffer_unref(&hdr->dovi_metadata);
+    av_buffer_unref(&hdr->hdr_vivid);
+    av_buffer_unref(&hdr->hdr_plus);
 }
 
-static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
+static void oh_decode_clear_hdr(OHCodecDecContext *s)
+{
+    for (int i = 0; i < s->nb_hdr_frames; i++)
+        oh_decode_unref_hdr(&s->hdr_frames[i]);
+    s->nb_hdr_frames = 0;
+}
+
+/*
+ * The OHOS decoder never surfaces SEI, so on the hardware path all in-band HDR
+ * metadata would otherwise be lost: the HDR10 mastering display colour volume
+ * and content light level (SEI 137/144), without which a player can only
+ * assume the 10000 nit PQ ceiling, and the dynamic HDR Vivid / HDR10+ payloads
+ * (ITU-T T.35). The NAL split performed for the Dolby Vision RPU already hands
+ * us every NAL of the packet, so walk the prefix SEI ones here and let the
+ * shared h2645 parser decode them.
+ *
+ * Mirrors the message loop of decode_nal_sei_message() in hevc/sei.c; the
+ * parameter-set dependent SEI types are deliberately not handled, which is why
+ * ff_h2645_sei_message_decode() is called directly instead of
+ * ff_hevc_decode_nal_sei() (the latter needs an HEVCParamSets this decoder does
+ * not maintain).
+ */
+static void oh_decode_parse_sei(AVCodecContext *avctx, const H2645NAL *nal,
+                                OHHdrFrame *hdr)
 {
     OHCodecDecContext *s = avctx->priv_data;
+    H2645SEI sei = { 0 };
+    GetByteContext gb;
+
+    // nal->data is the RBSP payload; skip the two-byte HEVC NAL header.
+    if (nal->size <= 2)
+        return;
+    bytestream2_init(&gb, nal->data + 2, nal->size - 2);
+
+    while (bytestream2_get_bytes_left(&gb) > 0) {
+        GetByteContext msg_gbyte;
+        GetBitContext msg_gb;
+        int payload_type = 0, payload_size = 0, byte = 0xFF;
+
+        while (byte == 0xFF) {
+            if (bytestream2_get_bytes_left(&gb) < 2 ||
+                payload_type > INT_MAX - 255)
+                goto done;
+            byte          = bytestream2_get_byteu(&gb);
+            payload_type += byte;
+        }
+        byte = 0xFF;
+        while (byte == 0xFF) {
+            if (bytestream2_get_bytes_left(&gb) < 1 + payload_size)
+                goto done;
+            byte          = bytestream2_get_byteu(&gb);
+            payload_size += byte;
+        }
+        if (bytestream2_get_bytes_left(&gb) < payload_size)
+            goto done;
+        bytestream2_init(&msg_gbyte, gb.buffer, payload_size);
+        if (init_get_bits8(&msg_gb, gb.buffer, payload_size) < 0)
+            goto done;
+        bytestream2_skipu(&gb, payload_size);
+
+        // Only the HDR payloads; decoding anything else here would duplicate
+        // work the OHOS decoder already did.
+        switch (payload_type) {
+        case SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35:
+        case SEI_TYPE_MASTERING_DISPLAY_COLOUR_VOLUME:
+        case SEI_TYPE_CONTENT_LIGHT_LEVEL_INFO:
+            ff_h2645_sei_message_decode(&sei, payload_type, AV_CODEC_ID_HEVC,
+                                        &msg_gb, &msg_gbyte, avctx);
+            break;
+        }
+    }
+
+done:
+    // The static metadata describes the whole coded video sequence (encoders
+    // repeat it at every IRAP), so it stays in effect until replaced.
+    if (sei.mastering_display.present)
+        s->mastering_display = sei.mastering_display;
+    if (sei.content_light.present)
+        s->content_light = sei.content_light;
+    // The dynamic payloads belong to this picture alone. Steal them; a later
+    // SEI NAL in the same packet wins.
+    if (sei.dynamic_hdr_vivid.info) {
+        av_buffer_unref(&hdr->hdr_vivid);
+        hdr->hdr_vivid = sei.dynamic_hdr_vivid.info;
+        sei.dynamic_hdr_vivid.info = NULL;
+    }
+    if (sei.dynamic_hdr_plus.info) {
+        av_buffer_unref(&hdr->hdr_plus);
+        hdr->hdr_plus = sei.dynamic_hdr_plus.info;
+        sei.dynamic_hdr_plus.info = NULL;
+    }
+    ff_h2645_sei_reset(&sei);
+}
+
+// A malformed RPU is dropped without costing the packet's other metadata;
+// only allocation failures are reported.
+static int oh_decode_parse_rpu(AVCodecContext *avctx, const H2645NAL *nal,
+                               OHHdrFrame *hdr)
+{
+    OHCodecDecContext *s = avctx->priv_data;
+    AVDOVIMetadata *dovi = NULL;
+    int ret;
+
+    hdr->dovi_rpu = av_buffer_alloc(nal->raw_size - 2);
+    if (!hdr->dovi_rpu)
+        return AVERROR(ENOMEM);
+    memcpy(hdr->dovi_rpu->data, nal->raw_data + 2, nal->raw_size - 2);
+
+    ret = ff_dovi_rpu_parse(&s->dovi_ctx, nal->data + 2, nal->size - 2,
+                            avctx->err_recognition);
+    if (ret < 0) {
+        av_buffer_unref(&hdr->dovi_rpu);
+        return 0;
+    }
+    ret = ff_dovi_get_metadata(&s->dovi_ctx, &dovi);
+    if (ret <= 0)
+        return ret;
+    hdr->dovi_metadata = av_buffer_create((uint8_t *)dovi, ret, NULL, NULL, 0);
+    if (!hdr->dovi_metadata) {
+        av_free(dovi);
+        return AVERROR(ENOMEM);
+    }
+    return 0;
+}
+
+static int oh_decode_parse_hdr(AVCodecContext *avctx, const AVPacket *pkt)
+{
+    OHCodecDecContext *s = avctx->priv_data;
+    OHHdrFrame hdr = { 0 };
+    const H2645NAL *rpu_nal = NULL;
     size_t sd_size;
     const uint8_t *sd;
-    H2645NAL *rpu_nal = NULL;
-    AVBufferRef *rpu = NULL, *metadata = NULL;
-    AVDOVIMetadata *dovi = NULL;
     int ret;
 
     if (avctx->codec_id != AV_CODEC_ID_HEVC || !pkt->size)
@@ -201,82 +334,104 @@ static int oh_decode_parse_dovi(AVCodecContext *avctx, const AVPacket *pkt)
     sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
     if (sd && sd_size >= sizeof(s->dovi_ctx.cfg))
         s->dovi_ctx.cfg = *(const AVDOVIDecoderConfigurationRecord *)sd;
-    ret = ff_h2645_packet_split(&s->dovi_pkt, pkt->data, pkt->size, avctx, 0,
+    ret = ff_h2645_packet_split(&s->hdr_pkt, pkt->data, pkt->size, avctx, 0,
                                 AV_CODEC_ID_HEVC, H2645_FLAG_SMALL_PADDING);
     if (ret < 0)
         return 0;
-    for (int i = s->dovi_pkt.nb_nals - 1; i >= 0; i--) {
-        H2645NAL *nal = &s->dovi_pkt.nals[i];
-        if (nal->type == HEVC_NAL_UNSPEC62 && nal->size > 2 &&
-            nal->raw_size > 2 && !nal->nuh_layer_id && !nal->temporal_id) {
-            rpu_nal = nal;
-            break;
-        }
+
+    for (int i = 0; i < s->hdr_pkt.nb_nals; i++) {
+        const H2645NAL *nal = &s->hdr_pkt.nals[i];
+        if (nal->nuh_layer_id)
+            continue;
+        if (nal->type == HEVC_NAL_SEI_PREFIX)
+            oh_decode_parse_sei(avctx, nal, &hdr);
+        else if (nal->type == HEVC_NAL_UNSPEC62 && !nal->temporal_id &&
+                 nal->size > 2 && nal->raw_size > 2)
+            rpu_nal = nal; // the last RPU of the packet wins
     }
-    if (!rpu_nal)
+
+    if (rpu_nal && (ret = oh_decode_parse_rpu(avctx, rpu_nal, &hdr)) < 0)
+        goto fail;
+
+    if (!hdr.dovi_rpu && !hdr.dovi_metadata && !hdr.hdr_vivid && !hdr.hdr_plus)
         return 0;
-    rpu = av_buffer_alloc(rpu_nal->raw_size - 2);
-    if (!rpu)
+
+    if (s->nb_hdr_frames == OH_HDR_QUEUE_SIZE) {
+        oh_decode_unref_hdr(&s->hdr_frames[0]);
+        memmove(&s->hdr_frames[0], &s->hdr_frames[1],
+                sizeof(s->hdr_frames[0]) * (OH_HDR_QUEUE_SIZE - 1));
+        s->nb_hdr_frames--;
+    }
+    hdr.pts = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
+              av_rescale_q(pkt->pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
+    s->hdr_frames[s->nb_hdr_frames++] = hdr;
+    return 0;
+
+fail:
+    oh_decode_unref_hdr(&hdr);
+    return ret;
+}
+
+// Moves ownership of *buf onto the frame. On success *buf is cleared; on
+// failure it is released. Either way the caller must not attach it again.
+static int oh_decode_attach_side_data(AVFrame *frame, AVBufferRef **buf,
+                                      enum AVFrameSideDataType type)
+{
+    if (!*buf)
+        return 0;
+    if (!av_frame_new_side_data_from_buf(frame, type, *buf)) {
+        av_buffer_unref(buf);
         return AVERROR(ENOMEM);
-    memcpy(rpu->data, rpu_nal->raw_data + 2, rpu_nal->raw_size - 2);
-    ret = ff_dovi_rpu_parse(&s->dovi_ctx, rpu_nal->data + 2,
-                            rpu_nal->size - 2, avctx->err_recognition);
-    if (ret < 0) {
-        av_buffer_unref(&rpu);
-        return 0;
     }
-    ret = ff_dovi_get_metadata(&s->dovi_ctx, &dovi);
-    if (ret < 0) {
-        av_buffer_unref(&rpu);
-        return ret;
-    }
-    if (ret > 0) {
-        metadata = av_buffer_create((uint8_t *)dovi, ret, NULL, NULL, 0);
-        if (!metadata) {
-            av_free(dovi);
-            av_buffer_unref(&rpu);
-            return AVERROR(ENOMEM);
-        }
-    }
-    if (s->nb_dovi_frames == OH_DOVI_QUEUE_SIZE) {
-        av_buffer_unref(&s->dovi_frames[0].rpu);
-        av_buffer_unref(&s->dovi_frames[0].metadata);
-        memmove(&s->dovi_frames[0], &s->dovi_frames[1],
-                sizeof(s->dovi_frames[0]) * (OH_DOVI_QUEUE_SIZE - 1));
-        s->nb_dovi_frames--;
-    }
-    s->dovi_frames[s->nb_dovi_frames++] = (OHDoviFrame) {
-        .pts = pkt->pts == AV_NOPTS_VALUE ? AV_NOPTS_VALUE :
-               av_rescale_q(pkt->pts, avctx->pkt_timebase, AV_TIME_BASE_Q),
-        .rpu = rpu, .metadata = metadata,
-    };
+    *buf = NULL;
     return 0;
 }
 
-static int oh_decode_attach_dovi(OHCodecDecContext *s, AVFrame *frame,
-                                 int64_t pts)
+// Attaches the HDR metadata that applies to an output frame: the static HDR10
+// metadata in effect, plus the per-picture payloads oh_decode_parse_hdr()
+// queued under its pts.
+static int oh_decode_attach_hdr(AVCodecContext *avctx, AVFrame *frame,
+                                int64_t pts)
 {
+    OHCodecDecContext *s = avctx->priv_data;
+    // The shared SEI exporter validates the values, reorders the primaries and
+    // honours side_data_prefer_packet against container (mdcv/clli) metadata
+    // that ff_decode_frame_props() may already have put on the frame.
+    H2645SEI sei = {
+        .mastering_display = s->mastering_display,
+        .content_light     = s->content_light,
+    };
     int found = -1;
-    for (int i = 0; i < s->nb_dovi_frames; i++)
-        if (s->dovi_frames[i].pts == pts) { found = i; break; }
+    int ret = ff_h2645_sei_to_frame(frame, &sei, avctx->codec_id, avctx,
+                                    NULL, 0, 0, 0);
+    if (ret < 0)
+        return ret;
+
+    for (int i = 0; i < s->nb_hdr_frames; i++)
+        if (s->hdr_frames[i].pts == pts) { found = i; break; }
     if (found < 0)
         return 0;
-    OHDoviFrame dovi = s->dovi_frames[found];
-    memmove(&s->dovi_frames[found], &s->dovi_frames[found + 1],
-            sizeof(s->dovi_frames[0]) * (s->nb_dovi_frames - found - 1));
-    s->nb_dovi_frames--;
-    if (dovi.rpu && !av_frame_new_side_data_from_buf(
-            frame, AV_FRAME_DATA_DOVI_RPU_BUFFER, dovi.rpu)) {
-        av_buffer_unref(&dovi.rpu);
-        av_buffer_unref(&dovi.metadata);
-        return AVERROR(ENOMEM);
-    }
-    if (dovi.metadata && !av_frame_new_side_data_from_buf(
-            frame, AV_FRAME_DATA_DOVI_METADATA, dovi.metadata)) {
-        av_buffer_unref(&dovi.metadata);
-        return AVERROR(ENOMEM);
-    }
-    return 0;
+    OHHdrFrame hdr = s->hdr_frames[found];
+    memmove(&s->hdr_frames[found], &s->hdr_frames[found + 1],
+            sizeof(s->hdr_frames[0]) * (s->nb_hdr_frames - found - 1));
+    s->nb_hdr_frames--;
+
+    ret = oh_decode_attach_side_data(frame, &hdr.dovi_rpu,
+                                     AV_FRAME_DATA_DOVI_RPU_BUFFER);
+    if (ret >= 0)
+        ret = oh_decode_attach_side_data(frame, &hdr.dovi_metadata,
+                                         AV_FRAME_DATA_DOVI_METADATA);
+    if (ret >= 0)
+        ret = oh_decode_attach_side_data(frame, &hdr.hdr_vivid,
+                                         AV_FRAME_DATA_DYNAMIC_HDR_VIVID);
+    if (ret >= 0)
+        ret = oh_decode_attach_side_data(frame, &hdr.hdr_plus,
+                                         AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
+
+    // Anything not attached (short-circuited by an error, or never present)
+    // is owned by us and must be released here.
+    oh_decode_unref_hdr(&hdr);
+    return ret;
 }
 
 static void oh_decode_release(AVRefStructOpaque unused, void *obj)
@@ -711,8 +866,8 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
     }
 
     av_packet_unref(&s->pkt);
-    oh_decode_clear_dovi(s);
-    ff_h2645_packet_uninit(&s->dovi_pkt);
+    oh_decode_clear_hdr(s);
+    ff_h2645_packet_uninit(&s->hdr_pkt);
     ff_dovi_ctx_unref(&s->dovi_ctx);
 
     av_fifo_freep2(&s->input_queue);
@@ -907,7 +1062,7 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
     frame->pts = av_rescale_q(attr->pts, AV_TIME_BASE_Q, avctx->pkt_timebase);
     frame->pkt_dts = AV_NOPTS_VALUE;
 
-    return oh_decode_attach_dovi(s, frame, attr->pts);
+    return oh_decode_attach_hdr(avctx, frame, attr->pts);
 }
 
 static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
@@ -953,7 +1108,7 @@ static int oh_decode_wrap_sw_buffer(AVCodecContext *avctx, AVFrame *frame,
         return ret;
     }
 
-    return 0;
+    return oh_decode_attach_hdr(avctx, frame, attr->pts);
 }
 
 static int oh_decode_output_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -1111,7 +1266,7 @@ static int oh_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             ret = ff_decode_get_packet(avctx, &s->pkt);
             if (ret < 0 && ret != AVERROR_EOF)
                 return ret;
-            if (ret >= 0 && (ret = oh_decode_parse_dovi(avctx, &s->pkt)) < 0)
+            if (ret >= 0 && (ret = oh_decode_parse_hdr(avctx, &s->pkt)) < 0)
                 return ret;
         }
 
@@ -1161,7 +1316,7 @@ static void oh_decode_flush(AVCodecContext *avctx)
     s->decode_status = 0;
     s->eof_sent = false;
     av_packet_unref(&s->pkt);
-    oh_decode_clear_dovi(s);
+    oh_decode_clear_hdr(s);
     ff_dovi_ctx_flush(&s->dovi_ctx);
     ff_mutex_unlock(&s->output_mutex);
     ff_mutex_unlock(&s->input_mutex);
