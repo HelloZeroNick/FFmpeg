@@ -98,6 +98,13 @@ typedef struct OHHdrFrame {
 typedef struct OHCodecDecRef {
     OH_AVCodec *dec;
     atomic_uint_fast64_t generation;
+    /* Live count of output buffers checked out to the renderer but not yet
+     * returned. Lives on the reference (not the decoder context) because a
+     * hardware frame can outlive oh_decode_close. A value that keeps growing
+     * means the consumer is not keeping up: the codec's buffer pool drains,
+     * AcquireNativeWindowBuffer starts failing, and Surface-side GPU/ION
+     * memory grows. See oh_decode_note_output_checked_out(). */
+    atomic_int outputs_outstanding;
 } OHCodecDecRef;
 
 typedef struct OHCodecDecContext {
@@ -156,6 +163,13 @@ typedef struct OHCodecDecContext {
      * means "not yet applied". */
     int vrr_enabled;
     int32_t vrr_fps;
+
+    /* Diagnostics for the output-buffer gauge on the codec reference (see
+     * OHCodecDecRef::outputs_outstanding): high-water mark and whether the
+     * warning has already been emitted, so a stuck consumer logs once
+     * instead of every frame. */
+    int outputs_outstanding_peak;
+    bool outputs_outstanding_warned;
 } OHCodecDecContext;
 
 #define OFFSET(x) offsetof(OHCodecDecContext, x)
@@ -488,6 +502,7 @@ static int oh_decode_create(OHCodecDecContext *s, AVCodecContext *avctx)
     }
     s->dec_ref->dec = s->dec;
     atomic_init(&s->dec_ref->generation, 0);
+    atomic_init(&s->dec_ref->outputs_outstanding, 0);
 
     return 0;
 }
@@ -861,6 +876,22 @@ static av_cold int oh_decode_close(AVCodecContext *avctx)
         else
             av_log(avctx, AV_LOG_ERROR, "Stop decoder failed, %d, %s\n",
                    err, av_err2str(ff_oh_err_to_ff_err(err)));
+        /* Report the still-outstanding pictures before dropping our own
+         * reference: they keep the codec alive, and a non-zero count here
+         * means the consumer is holding decoded pictures past teardown --
+         * exactly the pattern that shows up as growing GPU/ION usage across
+         * a long playback session. */
+        if (s->dec_ref) {
+            int left = atomic_load_explicit(&s->dec_ref->outputs_outstanding,
+                                            memory_order_acquire);
+            if (left > 0) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "ohcodec: closing with %d output buffer(s) still "
+                       "checked out (peak %d); the decoder will not be "
+                       "destroyed until they are released\n",
+                       left, s->outputs_outstanding_peak);
+            }
+        }
         s->dec = NULL;
         av_refstruct_unref(&s->dec_ref);
     }
@@ -1012,12 +1043,67 @@ int av_ohcodec_dec_set_vrr(AVCodecContext *avctx, int32_t fps, int enable)
     return 0;
 }
 
+/*
+ * Output-buffer accounting.
+ *
+ * The OHOS decoder hands pictures to the renderer as opaque tokens, and a
+ * token only returns its slot to the codec's pool when the consumer releases
+ * it. On the direct-to-Surface path that slot is also the NativeWindowBuffer
+ * the compositor is waiting on, so a consumer that lags drains the pool: the
+ * queue empties, OH_NativeImage_AcquireNativeWindowBuffer() starts failing,
+ * and the Surface's GPU/ION footprint grows. None of that is visible from the
+ * decoder's own state, which is why the gauge is worth keeping.
+ *
+ * This never blocks or throttles decoding -- it is observation only.
+ */
+static void oh_decode_note_output_checked_out(OHCodecDecContext *s,
+                                             void *ctx_log)
+{
+    OHCodecDecRef *ref = s->dec_ref;
+    if (!ref)
+        return;
+
+    int cur = atomic_fetch_add_explicit(&ref->outputs_outstanding, 1,
+                                        memory_order_acq_rel) + 1;
+
+    /* Pre-warning high-water mark: peak is tracked by the decoder thread,
+     * which is the only writer for this context. */
+    if (cur > s->outputs_outstanding_peak)
+        s->outputs_outstanding_peak = cur;
+
+    /* The pool depth is not exposed through the codec API, so 32 is a
+     * deliberately conservative "this cannot be normal" bound: typical video
+     * pools are 4..16 buffers. Warn once per context to stay readable. */
+    if (cur > 32 && !s->outputs_outstanding_warned) {
+        s->outputs_outstanding_warned = true;
+        av_log(ctx_log, AV_LOG_WARNING,
+               "ohcodec: %d output buffers checked out and not returned; "
+               "the consumer is not releasing decoded pictures, expect the "
+               "decoder pool to drain\n", cur);
+    }
+}
+
 static void oh_buffer_release(void *opaque, uint8_t *data)
 {
     AVOHCodecBuffer *buffer = opaque;
     if (!buffer)
         return;
     av_ohcodec_release_buffer(buffer, 0);
+
+    /* Account the return on the codec reference, which outlives both the
+     * decoder context and this token: a hardware frame may be held past
+     * oh_decode_close, and that is exactly the case worth counting. */
+    if (buffer->dec_ref) {
+        int left = atomic_fetch_sub_explicit(&buffer->dec_ref->outputs_outstanding,
+                                             1, memory_order_acq_rel) - 1;
+        if (left < 0) {
+            /* Should not happen; clamp so the gauge stays meaningful. */
+            atomic_store_explicit(&buffer->dec_ref->outputs_outstanding, 0,
+                                  memory_order_release);
+            av_log(NULL, AV_LOG_WARNING,
+                   "ohcodec: output buffer released more often than checked out\n");
+        }
+    }
 
     av_refstruct_unref(&buffer->dec_ref);
     av_free(buffer);
@@ -1052,6 +1138,7 @@ static int oh_decode_wrap_hw_buffer(AVCodecContext *avctx, AVFrame *frame,
         oh_buffer_release(buffer, NULL);
         return AVERROR(ENOMEM);
     }
+    oh_decode_note_output_checked_out(s, avctx);
     frame->hw_frames_ctx = av_buffer_ref(avctx->hw_frames_ctx);
     if (!frame->hw_frames_ctx) {
         av_buffer_unref(&frame->buf[0]);
