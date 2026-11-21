@@ -290,15 +290,19 @@ done:
         s->content_light = sei.content_light;
     // The dynamic payloads belong to this picture alone. Steal them; a later
     // SEI NAL in the same packet wins.
-    if (sei.dynamic_hdr_vivid.info) {
-        av_buffer_unref(&hdr->hdr_vivid);
-        hdr->hdr_vivid = sei.dynamic_hdr_vivid.info;
-        sei.dynamic_hdr_vivid.info = NULL;
+    //
+    // Since release/9.1 the T.35 payloads are parsed into H2645SEI.itut_t35
+    // (FFITUTT35Meta) instead of the removed dynamic_hdr_plus/dynamic_hdr_vivid
+    // members; the normal decoders export them from there, but
+    // ff_h2645_sei_to_frame() only forwards afd/a53_cc/lcevc/film_grain, so the
+    // two HDR payloads are handed to the frame ourselves below.
+    if (sei.itut_t35.hdr_vivid) {
+        av_buffer_replace(&hdr->hdr_vivid, sei.itut_t35.hdr_vivid);
+        av_buffer_unref(&sei.itut_t35.hdr_vivid);
     }
-    if (sei.dynamic_hdr_plus.info) {
-        av_buffer_unref(&hdr->hdr_plus);
-        hdr->hdr_plus = sei.dynamic_hdr_plus.info;
-        sei.dynamic_hdr_plus.info = NULL;
+    if (sei.itut_t35.hdr_plus) {
+        av_buffer_replace(&hdr->hdr_plus, sei.itut_t35.hdr_plus);
+        av_buffer_unref(&sei.itut_t35.hdr_plus);
     }
     ff_h2645_sei_reset(&sei);
 }
